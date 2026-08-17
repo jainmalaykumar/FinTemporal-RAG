@@ -1,3 +1,38 @@
+# Secrets / local config
 .env
+.env.local
+
+# Python
 __pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Runtime data (chat histories, ChromaDB) — shared between the Streamlit
+# fallback and the FastAPI backend, regenerated locally, never committed.
 data/
+
+# Node (frontend/ has its own .gitignore for node_modules, .next, etc. —
+# these are a defensive root-level backstop in case Node tooling is ever
+# added outside frontend/)
+node_modules/
+.next/
+.vercel
+
+# Claude Code local session/project state
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+*.swp
+*.swo
+*~

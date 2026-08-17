@@ -49,6 +49,8 @@ from youtube_transcript_api import (
 )
 import yt_dlp
 
+from utils.stock_list import ticker_to_company_name
+
 load_dotenv()
 
 logging.basicConfig(
@@ -553,18 +555,33 @@ class YouTubeIngestionPipeline:
 
         # ── Step 5b: Deterministic entity check (Python, no LLM) ──────────
         # Compare active_company against the extracted company list using
-        # case-insensitive substring matching.  This avoids asking a small
+        # case-insensitive substring matching. This avoids asking a small
         # local model to reason about negative constraints.
+        #
+        # active_company is a TICKER (e.g. "RELIANCE.NS"), but the extraction
+        # LLM reports COMPANY NAMES (e.g. "Reliance Industries") — comparing
+        # those two forms directly always mismatches. We check thoroughly
+        # instead of loosening the guardrail: resolve the ticker to its full
+        # name via the same Nifty 500 list the stock selector uses, and check
+        # every reasonable form (raw ticker, bare ticker, resolved name) so a
+        # genuine mismatch (a video about a different company) still warns.
         warning_message: str | None = None
         if active_company:
-            active_comp_clean  = active_company.strip().lower()
-            extracted_clean    = [c.strip().lower() for c in extraction.company_names]
-            # Match if active_company appears as a substring in any extracted name,
-            # OR any extracted name appears as a substring in active_company.
-            # This handles "HDFC Bank" ↔ "HDFC", "Reliance" ↔ "Reliance Industries", etc.
+            resolved_name = ticker_to_company_name(active_company)
+            bare_ticker = active_company.strip().upper().replace(".NS", "").replace(".BO", "")
+            candidate_names = {active_company.strip().lower(), bare_ticker.lower()}
+            if resolved_name:
+                candidate_names.add(resolved_name.strip().lower())
+
+            extracted_clean = [c.strip().lower() for c in extraction.company_names]
+            # Match if any candidate name for the active company appears as a
+            # substring of an extracted name, or vice versa. This handles
+            # "HDFC Bank" ↔ "HDFC", "Reliance Industries Ltd." ↔ "Reliance
+            # Industries", etc.
             match_found = any(
-                active_comp_clean in extracted or extracted in active_comp_clean
+                candidate in extracted or extracted in candidate
                 for extracted in extracted_clean
+                for candidate in candidate_names
             )
             if not match_found:
                 companies_found = extraction.company_names or ["other companies"]
@@ -639,18 +656,61 @@ class YouTubeIngestionPipeline:
         logger.debug("Gatekeeper raw response: %s", raw_response[:300])
 
         try:
-            result = _parse_llm_json(raw_response, GatekeeperResult)
+            return _parse_llm_json(raw_response, GatekeeperResult)  # type: ignore[return-value]
         except ValueError as exc:
-            # Unparseable response → hard reject for safety
+            first_error = exc
+
+        # ── Fallback 1: lenient scan ─────────────────────────────────────
+        # Small local models sometimes ignore the "output ONLY
+        # {is_financial_content}" instruction on content-rich transcripts and
+        # free-form a detailed extraction-style response instead, wrapping or
+        # burying the boolean (or omitting it, having answered "in spirit" by
+        # extracting financial figures). A regex scan recovers the boolean
+        # when it's present even if the rest of the JSON doesn't validate.
+        lenient_match = re.search(
+            r'"is_financial_content"\s*:\s*(true|false)', raw_response, re.IGNORECASE
+        )
+        if lenient_match:
+            is_financial = lenient_match.group(1).lower() == "true"
             logger.warning(
-                "Gatekeeper response unparseable — defaulting to REJECT. Error: %s", exc
+                "Gatekeeper response didn't match the strict schema, but a "
+                "lenient scan found is_financial_content=%s — using that.",
+                is_financial,
+            )
+            return GatekeeperResult(is_financial_content=is_financial)
+
+        # ── Fallback 2: one retry with a shorter, more forceful prompt ───
+        # No boolean signal at all — give the model one more try with a
+        # tighter instruction and a truncated transcript (less content to
+        # get "excited" about and start extracting instead of classifying).
+        logger.warning(
+            "Gatekeeper response had no recoverable signal — retrying once "
+            "with a stricter prompt. Original error: %s", first_error
+        )
+        retry_prompt = (
+            "Reply with ONLY valid JSON — no markdown, no explanation, no "
+            "extra keys, nothing else on any line:\n"
+            '{"is_financial_content": true}\n'
+            "or\n"
+            '{"is_financial_content": false}\n\n'
+            "Is the following transcript fundamentally about finance, stock "
+            "markets, corporate earnings, or macroeconomics?\n\n"
+            f"<transcript>\n{transcript[:1500]}\n</transcript>"
+        )
+        try:
+            retry_response = self.llm.invoke(retry_prompt)
+            result = _parse_llm_json(retry_response, GatekeeperResult)
+            logger.info("Gatekeeper retry succeeded.")
+            return result  # type: ignore[return-value]
+        except Exception as retry_exc:
+            logger.warning(
+                "Gatekeeper retry also failed — defaulting to REJECT. Error: %s",
+                retry_exc,
             )
             raise VideoRejectedError(
                 f"Rejected: Gatekeeper LLM returned an unparseable response. "
                 f"Raw output: {raw_response[:200]}"
-            ) from exc
-
-        return result  # type: ignore[return-value]
+            ) from first_error
 
     # ------------------------------------------------------------------
     # Stage 2 — Entity & Temporal Extraction

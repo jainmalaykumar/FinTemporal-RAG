@@ -515,3 +515,23 @@ NIFTY_500_STOCKS: list[str] = [
     "WOCKPHARMA.NS - Wockhardt Ltd.",
     "CUSTOM / OTHER (Enter Custom Ticker)",
 ]
+
+
+def ticker_to_company_name(ticker: str) -> str | None:
+    """
+    Looks up the full company name for a given ticker from NIFTY_500_STOCKS
+    (e.g. "RELIANCE.NS" -> "Reliance Industries Ltd."). Case-insensitive and
+    tolerant of a missing/mismatched .NS/.BO suffix. Returns None for tickers
+    outside the Nifty 500 (e.g. a custom ticker the user typed in).
+    """
+    bare = ticker.strip().upper().replace(".NS", "").replace(".BO", "")
+    if not bare:
+        return None
+    for entry in NIFTY_500_STOCKS:
+        if " - " not in entry:
+            continue
+        entry_ticker, entry_name = entry.split(" - ", 1)
+        entry_bare = entry_ticker.strip().upper().replace(".NS", "").replace(".BO", "")
+        if entry_bare == bare:
+            return entry_name.strip()
+    return None
