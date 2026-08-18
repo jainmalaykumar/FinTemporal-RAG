@@ -23,6 +23,10 @@ class FinRAGGenerator:
                 input_variables=["context", "query"],
                 template=(
                     "You are an elite Financial AI Analyst. Answer the user's question using ONLY the provided financial context below. "
+                    "Data-Source Hierarchy: if a live market chunk (Yahoo Finance / yfinance) states a metric as 'N/A', 'None', 'null', "
+                    "or otherwise missing, that alone is not sufficient grounds to refuse — first check the uploaded documents "
+                    "(PDF/Excel tables) and YouTube transcript chunks in the context for that same metric, or for the raw components "
+                    "needed to derive it, and use those instead. "
                     "If the information is insufficient to answer the query, state: 'I do not have sufficient context to answer this question.'\n\n"
                     "Context:\n"
                     "{context}\n\n"

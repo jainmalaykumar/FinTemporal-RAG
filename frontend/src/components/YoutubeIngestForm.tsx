@@ -5,8 +5,10 @@ import { Loader2, Video } from "lucide-react";
 import { ApiError, ingestYoutube } from "@/lib/api";
 import type { StatusMessage } from "@/lib/types";
 
-// Ports app.py's "YouTube News Ingestion" panel, wired to a real
-// POST /api/backend/ingest/youtube call.
+// Ports app.py's "YouTube News Ingestion" panel, wired to the job-based
+// POST /api/backend/ingest/youtube/start + GET .../status/{job_id} pair so
+// the ~60-90s pipeline (transcript fetch, gatekeeper, extraction) shows live
+// progress instead of a blind spinner.
 
 export default function YoutubeIngestForm({
   disabled,
@@ -21,6 +23,7 @@ export default function YoutubeIngestForm({
 }) {
   const [url, setUrl] = useState("");
   const [loading, setLoading] = useState(false);
+  const [stage, setStage] = useState<string | null>(null);
 
   async function handleIngest() {
     if (!url.trim()) {
@@ -28,8 +31,9 @@ export default function YoutubeIngestForm({
       return;
     }
     setLoading(true);
+    setStage("Starting…");
     try {
-      const result = await ingestYoutube(url.trim(), activeCompany);
+      const result = await ingestYoutube(url.trim(), activeCompany, setStage);
       const title = result.metadata?.title ?? "video";
       const channel = result.metadata?.channel ?? "Unknown channel";
       const pubDate = result.metadata?.publish_date ?? "";
@@ -63,6 +67,7 @@ export default function YoutubeIngestForm({
       onStatus({ type: "error", text: message });
     } finally {
       setLoading(false);
+      setStage(null);
     }
   }
 
@@ -85,8 +90,8 @@ export default function YoutubeIngestForm({
       >
         {loading ? (
           <>
-            <Loader2 size={14} className="animate-spin" />
-            Running gatekeeper…
+            <Loader2 size={14} className="animate-spin shrink-0" />
+            <span className="truncate">{stage ?? "Working…"}</span>
           </>
         ) : (
           <>

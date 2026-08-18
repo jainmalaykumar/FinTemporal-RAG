@@ -535,3 +535,40 @@ def ticker_to_company_name(ticker: str) -> str | None:
         if entry_bare == bare:
             return entry_name.strip()
     return None
+
+
+def tickers_match(detected_names: "str | list[str] | None", target_ticker: str) -> bool:
+    """
+    Thorough (not lenient) match between a target ticker and a set of
+    detected company names/tickers (e.g. from LLM extraction during YouTube
+    ingestion, or from doc_processor.py's regex-based detection).
+
+    A naive direct comparison of "RELIANCE.NS" against "Reliance Industries"
+    always fails since one is a ticker and the other a name — this resolves
+    the target ticker to its full Nifty 500 company name first, then checks
+    the target's raw ticker, bare ticker, AND resolved name against every
+    detected name via case-insensitive substring matching in both
+    directions, so a genuine mismatch still doesn't match.
+
+    ``detected_names`` may be a comma-joined string (how it's stored in
+    ChromaDB metadata) or a list.
+    """
+    if not detected_names or not target_ticker:
+        return False
+    if isinstance(detected_names, str):
+        detected_names = [n.strip() for n in detected_names.split(",") if n.strip()]
+    if not detected_names:
+        return False
+
+    resolved_name = ticker_to_company_name(target_ticker)
+    bare_ticker = target_ticker.strip().upper().replace(".NS", "").replace(".BO", "")
+    candidates = {target_ticker.strip().lower(), bare_ticker.lower()}
+    if resolved_name:
+        candidates.add(resolved_name.strip().lower())
+
+    detected_clean = [d.strip().lower() for d in detected_names if d.strip()]
+    return any(
+        candidate in detected or detected in candidate
+        for detected in detected_clean
+        for candidate in candidates
+    )

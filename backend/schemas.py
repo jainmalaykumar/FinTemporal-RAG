@@ -10,6 +10,7 @@ class ChatMessage(BaseModel):
     role: str
     content: str
     context: list[str] | None = None
+    data_freshness: str | None = None
 
 
 class UserScopedRequest(BaseModel):

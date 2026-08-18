@@ -25,8 +25,11 @@ class FinancialDataFetcher:
         Retrieves fundamental metrics for a given ticker using FMP (primary) or yfinance (fallback).
         Formats the raw data into clean, readable sentences.
         """
-        current_date = datetime.now().strftime('%Y-%m-%d')
-        
+        # Full date+time (not just date) so the temporal reranker can decay
+        # JIT snapshots by day rather than only by year — a metric fetched
+        # this morning should outrank the same metric cached three weeks ago.
+        current_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
         try:
             if self.fmp_api_key:
                 profile_url = f"https://financialmodelingprep.com/api/v3/profile/{ticker}?apikey={self.fmp_api_key}"
@@ -173,30 +176,34 @@ class FinancialDataFetcher:
             news_items = self.google_news.get_news(search_term)
             
             results = []
-            current_date = datetime.now().strftime('%Y-%m-%d')
-            
+            # Full date+time (not just date) so the temporal reranker can
+            # decay by day, not just by year.
+            current_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
             # Guard against None if API limit or network issue occurs
             if not news_items:
                 logging.warning(f"No news items found for {ticker}.")
                 return []
-                
+
             for item in news_items:
                 try:
                     title_html = item.get('title', '')
                     description_html = item.get('description', '')
-                    
+
                     # Clean HTML using BeautifulSoup to extract plain text
                     clean_title = BeautifulSoup(title_html, "html.parser").get_text(separator=" ", strip=True)
                     clean_desc = BeautifulSoup(description_html, "html.parser").get_text(separator=" ", strip=True)
-                    
+
                     # Parse published date if available, else fallback to current date
                     pub_date = item.get('published date')
                     formatted_date = current_date
                     if pub_date:
                         try:
-                            # GNews typical format: 'Tue, 28 Feb 2023 15:00:00 GMT'
+                            # GNews format: 'Tue, 28 Feb 2023 15:00:00 GMT' — GNews
+                            # already gives us time-of-day precision; keep it
+                            # instead of truncating to date-only as before.
                             parsed_date = datetime.strptime(pub_date, '%a, %d %b %Y %H:%M:%S %Z')
-                            formatted_date = parsed_date.strftime('%Y-%m-%d')
+                            formatted_date = parsed_date.strftime('%Y-%m-%d %H:%M:%S')
                         except ValueError:
                             pass # Keep fallback current_date
 

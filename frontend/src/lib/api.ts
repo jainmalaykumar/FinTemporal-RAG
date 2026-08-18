@@ -102,33 +102,61 @@ export function ingestDocuments(
   );
 }
 
+export interface YoutubeIngestResult {
+  chunks: number;
+  metadata: Record<string, string>;
+  warning: string | null;
+}
+
+interface IngestJobStatus {
+  stage: string;
+  done: boolean;
+  result: YoutubeIngestResult | null;
+}
+
+/**
+ * Ingestion runs a transcript fetch + up to 2 gatekeeper LLM calls + 1
+ * extraction LLM call locally via Ollama — realistically 20s to a couple of
+ * minutes. Rather than one long blocking request, this starts a background
+ * job and polls its status, so `onStageChange` can show live progress
+ * ("Fetching transcript…" → "Checking relevance…" → …) instead of a blind
+ * spinner for the whole duration.
+ */
 export async function ingestYoutube(
   url: string,
   activeCompany: string,
-): Promise<{ chunks: number; metadata: Record<string, string>; warning: string | null }> {
-  // Ingestion runs a transcript fetch + up to 2 gatekeeper LLM calls + 1
-  // extraction LLM call locally via Ollama, which can legitimately take a
-  // couple of minutes. Give it a generous, explicit timeout so a genuine
-  // hang produces a clear "timed out" message instead of an ambiguous
-  // network-error one.
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 240_000);
+  onStageChange?: (stage: string) => void,
+): Promise<YoutubeIngestResult> {
   try {
-    const res = await fetch("/api/backend/ingest/youtube", {
+    const { job_id } = await fetch("/api/backend/ingest/youtube/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url, active_company: activeCompany }),
-      signal: controller.signal,
-    });
-    return await unwrap(res);
-  } catch (err) {
-    if (err instanceof DOMException && err.name === "AbortError") {
-      throw new Error("Ingestion timed out after 4 minutes — the video may be unusually long, or Ollama may be stuck. Check the backend terminal for what it was doing.");
+    }).then((r) => unwrap<{ job_id: string }>(r));
+
+    const startTime = Date.now();
+    const TIMEOUT_MS = 240_000;
+
+    for (;;) {
+      if (Date.now() - startTime > TIMEOUT_MS) {
+        throw new Error(
+          "Ingestion timed out after 4 minutes — the video may be unusually long, or Ollama may be stuck. Check the backend terminal for what it was doing.",
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      const status = await fetch(`/api/backend/ingest/youtube/status/${job_id}`).then((r) =>
+        unwrap<IngestJobStatus>(r),
+      );
+      onStageChange?.(status.stage);
+      if (status.done) {
+        return status.result as YoutubeIngestResult;
+      }
     }
-    console.error("ingestYoutube failed:", err);
+  } catch (err) {
+    if (!(err instanceof ApiError)) {
+      console.error("ingestYoutube failed:", err);
+    }
     throw err;
-  } finally {
-    clearTimeout(timeoutId);
   }
 }
 

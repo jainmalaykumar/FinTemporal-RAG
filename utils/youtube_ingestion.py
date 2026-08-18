@@ -36,7 +36,7 @@ import os
 import re
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
 from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
@@ -49,7 +49,7 @@ from youtube_transcript_api import (
 )
 import yt_dlp
 
-from utils.stock_list import ticker_to_company_name
+from utils.stock_list import tickers_match
 
 load_dotenv()
 
@@ -484,6 +484,7 @@ class YouTubeIngestionPipeline:
         preferred_languages: list[str] | None = None,
         skip_gatekeeper: bool = False,
         active_company: str | None = None,
+        on_progress: "Callable[[str], None] | None" = None,
     ) -> dict:
         """
         Full ingestion pipeline for a single YouTube URL.
@@ -501,6 +502,11 @@ class YouTubeIngestionPipeline:
             When provided, a deterministic Python check compares it against the
             company names extracted by the Extraction LLM.  A mismatch is a
             soft accept: chunks are stored and ``warning`` is set in the result.
+        on_progress : Callable[[str], None] | None
+            Optional callback invoked with a short human-readable stage label
+            each time the pipeline moves to a new step (e.g. for a UI to show
+            live progress during the ~60-90s this can take). Purely additive —
+            omitting it changes nothing about how ingest() behaves.
 
         Returns
         -------
@@ -520,24 +526,32 @@ class YouTubeIngestionPipeline:
         TranscriptFetchError
             If the transcript cannot be retrieved.
         """
+        def _progress(stage: str) -> None:
+            if on_progress:
+                on_progress(stage)
+
         logger.info("=== YouTubeIngestionPipeline.ingest() START ===")
         logger.info("URL: %s", youtube_url)
 
         # ── Step 1: Extract video ID ───────────────────────────────────────
+        _progress("Reading video URL…")
         video_id = _extract_video_id(youtube_url)
         logger.info("Video ID: %s", video_id)
 
         # ── Step 2: Fetch metadata (title, channel, publish_date) ────────────
+        _progress("Fetching video metadata…")
         metadata = _fetch_video_metadata(video_id)
         title        = metadata["title"]
         channel      = metadata["channel"]
         publish_date = metadata["publish_date"]
 
         # ── Step 3: Fetch transcript ───────────────────────────────────────
+        _progress("Fetching transcript…")
         transcript = _fetch_transcript(video_id, preferred_languages)
 
         # ── Step 4: Gatekeeper — DOMAIN VALIDATION ONLY (LLM) ────────────
         if not skip_gatekeeper:
+            _progress("Checking whether this video is financial content…")
             gatekeeper_result = self._run_gatekeeper(title, transcript)
             if not gatekeeper_result.is_financial_content:
                 raise VideoRejectedError(
@@ -546,6 +560,7 @@ class YouTubeIngestionPipeline:
             logger.info("Gatekeeper PASSED — is_financial_content=True")
 
         # ── Step 5: Entity & Temporal Extraction ───────────────────────────
+        _progress("Extracting companies and time periods…")
         extraction = self._run_extraction(transcript)
         logger.info(
             "Extraction complete — companies=%s, temporal=%s",
@@ -554,35 +569,14 @@ class YouTubeIngestionPipeline:
         )
 
         # ── Step 5b: Deterministic entity check (Python, no LLM) ──────────
-        # Compare active_company against the extracted company list using
-        # case-insensitive substring matching. This avoids asking a small
-        # local model to reason about negative constraints.
-        #
-        # active_company is a TICKER (e.g. "RELIANCE.NS"), but the extraction
-        # LLM reports COMPANY NAMES (e.g. "Reliance Industries") — comparing
-        # those two forms directly always mismatches. We check thoroughly
-        # instead of loosening the guardrail: resolve the ticker to its full
-        # name via the same Nifty 500 list the stock selector uses, and check
-        # every reasonable form (raw ticker, bare ticker, resolved name) so a
-        # genuine mismatch (a video about a different company) still warns.
+        # Compare active_company against the extracted company list. This
+        # avoids asking a small local model to reason about negative
+        # constraints, and shares its matching logic (thorough, not lenient
+        # — resolves the ticker to its Nifty 500 company name before
+        # comparing) with vector_store.py's company-scoped retrieval.
         warning_message: str | None = None
         if active_company:
-            resolved_name = ticker_to_company_name(active_company)
-            bare_ticker = active_company.strip().upper().replace(".NS", "").replace(".BO", "")
-            candidate_names = {active_company.strip().lower(), bare_ticker.lower()}
-            if resolved_name:
-                candidate_names.add(resolved_name.strip().lower())
-
-            extracted_clean = [c.strip().lower() for c in extraction.company_names]
-            # Match if any candidate name for the active company appears as a
-            # substring of an extracted name, or vice versa. This handles
-            # "HDFC Bank" ↔ "HDFC", "Reliance Industries Ltd." ↔ "Reliance
-            # Industries", etc.
-            match_found = any(
-                candidate in extracted or extracted in candidate
-                for extracted in extracted_clean
-                for candidate in candidate_names
-            )
+            match_found = tickers_match(extraction.company_names, active_company)
             if not match_found:
                 companies_found = extraction.company_names or ["other companies"]
                 warning_message = (
@@ -597,6 +591,7 @@ class YouTubeIngestionPipeline:
                 )
 
         # ── Step 6: Chunk the transcript ───────────────────────────────────
+        _progress("Building and storing chunks…")
         chunks = self._build_chunks(
             transcript    = transcript,
             video_id      = video_id,
@@ -840,6 +835,7 @@ def process_youtube_url(
     preferred_languages: list[str] | None = None,
     skip_gatekeeper: bool = False,
     active_company: str | None = None,
+    on_progress: "Callable[[str], None] | None" = None,
 ) -> dict:
     """
     Public convenience wrapper around YouTubeIngestionPipeline.ingest().
@@ -879,6 +875,7 @@ def process_youtube_url(
         preferred_languages=preferred_languages,
         skip_gatekeeper=skip_gatekeeper,
         active_company=active_company,
+        on_progress=on_progress,
     )
 
 

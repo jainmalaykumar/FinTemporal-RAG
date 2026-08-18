@@ -6,9 +6,28 @@ from collections import defaultdict, deque
 from datetime import datetime
 from chromadb.utils import embedding_functions
 
+from utils.stock_list import tickers_match
+
 
 # Configure basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+def _parse_date_published(value) -> "datetime | None":
+    """
+    Parses a JIT chunk's Date_Published metadata value, which may be either
+    the old date-only format ("2026-08-17", from data stored before this
+    fix) or the new full-datetime format ("2026-08-17 14:32:05"). Returns
+    None if unparseable so callers can fall back gracefully.
+    """
+    if not value or not isinstance(value, str):
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    return None
 
 
 def balance_chunks_by_source_and_year(scored_docs: list, max_k: int = 6) -> list:
@@ -228,12 +247,17 @@ class ChromaDBManager:
             logging.error(f"Error during market search: {e}")
             return []
 
-    def search_documents(self, query: str, k: int = 6, fetch_k: int = 20) -> list:
+    def search_documents(self, query: str, k: int = 6, fetch_k: int = 20, target_ticker: "str | None" = None) -> list:
         """
-        Searches the uploaded_documents collection WITHOUT a Ticker_Symbol filter.
-        Retrieves fetch_k=20 candidates, applies time-decay scoring across ALL of
-        them in-memory, then calls balance_chunks_by_source_and_year() to ensure
-        equal representation from every uploaded file / financial year before
+        Searches the uploaded_documents collection. ChromaDB itself applies no
+        Ticker_Symbol filter here (document chunks don't carry that field —
+        see detected_tickers instead), so company scoping happens in the
+        reranker: when target_ticker is given, chunks confidently about a
+        different company are strongly demoted rather than competing purely
+        on semantic similarity. Retrieves fetch_k=20 candidates, applies
+        time-decay + company-match scoring across ALL of them in-memory, then
+        calls balance_chunks_by_source_and_year() to ensure equal
+        representation from every uploaded file / financial year before
         slicing to k. This prevents newer documents from monopolising the context.
         """
         if not query:
@@ -269,7 +293,8 @@ class ChromaDBManager:
 
             # Score ALL fetch_k candidates (returns raw tuples, not final dicts)
             all_scored = self._time_weighted_rerank(
-                docs, metadatas, distances, k=actual_fetch_k, return_scored=True
+                docs, metadatas, distances, k=actual_fetch_k, return_scored=True,
+                target_ticker=target_ticker,
             )
 
             # Balance across sources/years, then take top k
@@ -304,13 +329,42 @@ class ChromaDBManager:
         metadatas: list,
         distances: list,
         k: int,
-        return_scored: bool = False
+        return_scored: bool = False,
+        target_ticker: "str | None" = None,
     ):
         """
-        Scores each (doc, meta, distance) triple with time-decay weighting.
+        Scores each (doc, meta, distance) triple with time-decay weighting
+        and, when target_ticker is given, a company-match adjustment.
 
         Chroma cosine space: distance ∈ [0, 2], lower = more similar.
         base_score = 1.0 - distance  →  similarity in [-1, 1].
+
+        Recency:
+            JIT chunks (market/news) carry a full Date_Published timestamp —
+            age is computed in days (converted to fractional years) for
+            day-level precision, since market data can go stale within days,
+            not just years. Uploaded-document chunks only carry a
+            whole-number `year` — age is computed in whole years, as before.
+            A chunk with neither signal is treated as current (no penalty),
+            matching the original behavior. Both paths share the same
+            20%-per-year compound decay curve so the two scales stay
+            consistent with each other.
+
+        Company match (only meaningful when target_ticker is given — market
+        search already hard-filters by Ticker_Symbol via a `where` clause
+        before this ever runs, so this only affects search_documents /
+        search_youtube_only / search_pdfs_only, which have no such filter):
+            - No detected company on the chunk → neutral. Detection only
+              scans part of a document/transcript, so plenty of legitimate
+              chunks won't have this metadata — they shouldn't be punished
+              for it.
+            - Detected company matches target → boosted.
+            - Detected company confidently does NOT match target → strongly
+              demoted. This is the actual fix for cross-company bleed in
+              document/YouTube retrieval (previously unfiltered by company
+              at all). The match itself is thorough, not lenient — see
+              stock_list.tickers_match — so it still yields when detection
+              is genuinely inconclusive rather than guessing wrong.
 
         Args:
             return_scored: When True, returns the full sorted list of
@@ -320,22 +374,36 @@ class ChromaDBManager:
                            When False (default), returns the final top-k dicts.
         """
         scored_docs = []
-        current_year = 2026
+        now = datetime.now()
+        current_year = now.year
 
         for doc, meta, dist in zip(docs, metadatas, distances):
             base_score = 1.0 - dist
 
-            raw_year = meta.get('year')
-            year = (
-                int(raw_year)
-                if (raw_year is not None and str(raw_year).strip().isdigit())
-                else 2026
-            )
+            # ── Recency ──────────────────────────────────────────────────
+            date_published = meta.get('Date_Published')
+            parsed_date = _parse_date_published(date_published) if date_published else None
 
-            age = max(0, current_year - year)
-            time_boost = 0.8 ** age  # 20% compound penalty per year of age
+            if parsed_date is not None:
+                age_days = max(0.0, (now - parsed_date).total_seconds() / 86400)
+                age_years = age_days / 365.0
+            else:
+                raw_year = meta.get('year')
+                if raw_year is not None and str(raw_year).strip().isdigit():
+                    age_years = max(0, current_year - int(raw_year))
+                else:
+                    age_years = 0  # unknown date -> treat as current, as before
 
-            adjusted_score = base_score * time_boost
+            time_boost = 0.8 ** age_years  # 20% compound penalty per year of age
+
+            # ── Company match ───────────────────────────────────────────
+            company_boost = 1.0
+            if target_ticker:
+                detected = meta.get('detected_tickers') or meta.get('detected_company')
+                if detected:
+                    company_boost = 1.3 if tickers_match(detected, target_ticker) else 0.15
+
+            adjusted_score = base_score * time_boost * company_boost
             scored_docs.append((adjusted_score, doc, meta))
 
         scored_docs.sort(key=lambda x: x[0], reverse=True)
@@ -507,16 +575,16 @@ class ChromaDBManager:
     # identical regardless of which retrieval path is active.
     # ──────────────────────────────────────────────────────────────────────────
 
-    def search_docs_only(self, query: str, k: int = 6, fetch_k: int = 20) -> list:
+    def search_docs_only(self, query: str, k: int = 6, fetch_k: int = 20, target_ticker: "str | None" = None) -> list:
         """
         BYOD path: searches ONLY the uploaded_documents collection.
         Identical to search_documents() — no market data is fetched or queried.
-        Time-decay + source/year balancing still apply so the temporal ranking
-        is fully consistent with the hybrid path.
+        Time-decay + company-match + source/year balancing still apply so the
+        temporal/company ranking is fully consistent with the hybrid path.
         """
-        return self.search_documents(query=query, k=k, fetch_k=fetch_k)
+        return self.search_documents(query=query, k=k, fetch_k=fetch_k, target_ticker=target_ticker)
 
-    def search_youtube_only(self, query: str, k: int = 6, fetch_k: int = 20) -> list:
+    def search_youtube_only(self, query: str, k: int = 6, fetch_k: int = 20, target_ticker: "str | None" = None) -> list:
         """
         Scope-filtered path: retrieves ONLY chunks whose source_type metadata
         field equals 'youtube_transcript'. PDF/Excel document chunks are excluded.
@@ -557,7 +625,8 @@ class ChromaDBManager:
             )
 
             all_scored = self._time_weighted_rerank(
-                docs, metadatas, distances, k=actual_fetch_k, return_scored=True
+                docs, metadatas, distances, k=actual_fetch_k, return_scored=True,
+                target_ticker=target_ticker,
             )
             balanced = balance_chunks_by_source_and_year(all_scored, max_k=k)
             return [{"text_chunk": doc, "metadata": meta} for _, doc, meta in balanced]
@@ -566,7 +635,7 @@ class ChromaDBManager:
             logging.error("Error during YouTube-only search: %s", e)
             return []
 
-    def search_pdfs_only(self, query: str, k: int = 6, fetch_k: int = 20) -> list:
+    def search_pdfs_only(self, query: str, k: int = 6, fetch_k: int = 20, target_ticker: "str | None" = None) -> list:
         """
         Scope-filtered path: retrieves ONLY chunks whose source_type is NOT
         'youtube_transcript' (i.e. PDF, TXT, Excel uploads).
@@ -607,7 +676,8 @@ class ChromaDBManager:
             )
 
             all_scored = self._time_weighted_rerank(
-                docs, metadatas, distances, k=actual_fetch_k, return_scored=True
+                docs, metadatas, distances, k=actual_fetch_k, return_scored=True,
+                target_ticker=target_ticker,
             )
             balanced = balance_chunks_by_source_and_year(all_scored, max_k=k)
             return [{"text_chunk": doc, "metadata": meta} for _, doc, meta in balanced]
@@ -631,8 +701,11 @@ class ChromaDBManager:
 
         Time-decay reranking is applied inside each constituent search call,
         so both domains are scored on the same temporal basis before merging.
+        `ticker` scopes both: market search hard-filters by it (unchanged),
+        document search uses it to demote chunks confidently about a
+        different company.
         """
-        doc_chunks    = self.search_documents(query=query, k=doc_k,    fetch_k=fetch_k)
+        doc_chunks    = self.search_documents(query=query, k=doc_k,    fetch_k=fetch_k, target_ticker=ticker)
         market_chunks = self.search(query=query, ticker=ticker, k=market_k, fetch_k=fetch_k)
         return doc_chunks, market_chunks
 

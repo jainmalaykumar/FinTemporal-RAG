@@ -27,7 +27,15 @@ _FUSION = (
     "Synthesize quantitative figures from Excel Markdown tables "
     "with qualitative commentary from PDF annual reports and news articles."
 )
-_PREAMBLE = f"{_GUARDRAIL}\n{_DATE_MAP}\n{_FUSION}\n\n"
+_HIERARCHY = (
+    "Data-Source Hierarchy: If a live market chunk (Yahoo Finance / yfinance) states a metric as "
+    "'N/A', 'None', 'null', or otherwise missing, that is NOT sufficient grounds to refuse. Before "
+    "answering, also check the uploaded documents (PDF/Excel tables) and YouTube transcript chunks "
+    "in the context for that same metric, or for the raw components needed to derive it, and use "
+    "those instead. Only give the refusal sentence if the metric is missing or underivable from ALL "
+    "three sources — live market data, uploaded documents, AND YouTube transcripts."
+)
+_PREAMBLE = f"{_GUARDRAIL}\n{_DATE_MAP}\n{_FUSION}\n{_HIERARCHY}\n\n"
 
 ENHANCED_QUERY_PROMPTS: dict[str, str] = {
 
@@ -72,10 +80,11 @@ ENHANCED_QUERY_PROMPTS: dict[str, str] = {
     "What is the Free Cash Flow trend?": _PREAMBLE + """
     Target: Analyze the Free Cash Flow (FCF) trend over time.
 
-    Precedence Rules:
-    1. EXTRACT: If Free Cash Flow figures are explicitly stated, list them in chronological order and state the trend (growing, declining, or volatile).
-    2. DERIVE: If explicit FCF is absent, calculate approximate FCF for each year as (Operating Cash Flow + Investing Cash Flow) using the Cash Flow table.
-    3. REFUSE: If no cash flow data is present, reply strictly: "I do not have sufficient context to analyze the Free Cash Flow trend."
+    Steps:
+    1. Check for an explicit Free Cash Flow number in the context. If a real number exists (not N/A), report it directly.
+    2. If no explicit number exists, use the CASH FLOW table rows Cash from Operating Activity and Cash from Investing Activity (NOT the Profit & Loss table rows Profit before tax or Interest — those are unrelated). For each Report Date column, compute that column's FCF as Cash from Operating Activity + Cash from Investing Activity, using that same column's own date. Show the FCF for every available year and state whether the trend is growing, declining, or volatile.
+    3. Only if the CASH FLOW table rows Cash from Operating Activity and Cash from Investing Activity are completely absent from the context, reply with only this sentence and nothing else: "I do not have sufficient context to analyze the Free Cash Flow trend."
+    Never combine step 3's sentence with a computed answer in the same response — pick one.
     """,
 
     "Provide segment-wise revenue": _PREAMBLE + """

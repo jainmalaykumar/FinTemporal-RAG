@@ -4,6 +4,7 @@ export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   context?: string[];
+  data_freshness?: string | null;
 }
 
 export interface ChatSessionSummary {
