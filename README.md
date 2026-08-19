@@ -125,18 +125,3 @@ Open **http://localhost:3000**.
 cd frontend && npm run build && npm start   # :3000
 conda activate ChatBot && uvicorn backend.main:app --host 127.0.0.1 --port 8000  # :8000
 ```
-
-## Known limitations
-
-- **`FMP_API_KEY`** needs to be a valid, active key — quantitative-metrics
-  fetches fall back to yfinance automatically (by design) if it fails.
-- **YouTube ingestion gatekeeper**: the local 7B model doesn't always follow
-  the gatekeeper's strict JSON-only schema on richer transcripts; the code
-  fail-closes to a rejection rather than risk ingesting off-topic content,
-  with one automatic retry on a stricter prompt.
-- **Numeric derivation questions** (e.g. deriving Free Cash Flow from raw
-  cash-flow-statement components) depend on the local 7B model correctly
-  following multi-step arithmetic instructions — prompt design substantially
-  improves reliability here, but a small local model can still occasionally
-  decline a question it has enough context to answer. A deterministic
-  backend calculation path would remove this residual flakiness entirely.
